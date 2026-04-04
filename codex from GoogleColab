@@ -38,16 +38,16 @@ weight_decay = 0.001
 
 print(f"Device: {device}")
 
-"""# **Dataset preprocessing**"""
+"""# **Data preprocessing**"""
 
-# Preparing data for (anchor, positive)
+# Preparing pairs (anchor, positive)
 def prepare_pair(example):
     return {
         'anchor': example['query'],
         'positive': example['answer']
     }
 
-# Preparing data for (anchor, positive, negative)
+# Preparing triplets (anchor, positive, negative)
 def prepare_triplet(example):
     negatives = [c for c in example["candidate_chunks"] if c != example["answer"]]
     neg = choice(negatives)
@@ -59,7 +59,7 @@ def prepare_triplet(example):
 
 ds = load_dataset("sapienzanlp-course-materials/hw-mnlp-2026")
 
-# Splitting the given dataset in 90/10 train/dev
+# Splitting the given dataset in 90/10 train/dev (seed = 42 for reproducibility)
 train_dev_split = ds['train'].train_test_split(test_size=0.1, seed=42)
 ds_train = train_dev_split['train']
 ds_dev = train_dev_split['test']
@@ -69,31 +69,79 @@ pair_ds_train = ds_train.map(prepare_pair, remove_columns=ds_train.column_names)
 pair_ds_dev = ds_dev.map(prepare_pair, remove_columns=ds_dev.column_names)
 
 triplet_ds_train = ds_train.map(prepare_triplet, remove_columns=ds_train.column_names)
-triplet_ds_dev = ds_dev.map(prepare_triplet, remove_columns=ds_train.column_names)
+triplet_ds_dev = ds_dev.map(prepare_triplet, remove_columns=ds_dev.column_names)
 
 """# **Evaluation Metrics**
 
 ## **Helpers**
 """
 
-def embed_query_and_candidates(model, query, candidates, batch_size=32):
+def embed_batch_of_examples(batch, model):
+    """
+    This function is used to build the embedded version of the dataset employed
+    for evaluation. By processing examples in batches and by flattening
+    the candidate chunks for each batch, it reduces the number of
+    calls to the model making the entire process more efficient.
+    """
 
-    q_emb = model.encode(
-        [query], # must be a list
-        convert_to_tensor = True,
-        batch_size = 1,
-        show_progress_bar = False,
-    )
+    # Embedding of queries
+    q_embs = model.encode(batch["query"])
 
-    # embedding of candidates
-    cand_embs = model.encode(
-        candidates,
-        convert_to_tensor = True,
+    # To optimize the number of times we encode data, we encode just one flatten
+    # version of the candidate chunks per example. Next we recover the correct
+    # list of chunks by iterating over the embeddings and slicing them.
+    flat_candidates = []
+    numbers_candidates = []
+
+    # Starting from a shape [B, K] --> [B*K]
+    for cands in batch["candidate_chunks"]:
+        flat_candidates.extend(cands)
+        numbers_candidates.append(len(cands))
+
+    flat_cand_embs = model.encode(flat_candidates)
+
+    cand_embs = []
+    idx = 0
+
+    # Recovering the embeddings by slicing the flattened version
+    for l in numbers_candidates:
+        cand_embs.append(flat_cand_embs[idx:idx+l])
+        idx += l
+
+    return {
+        "q_emb": q_embs,
+        "cand_embs": cand_embs,
+        "answer_pos": batch["answer_pos"]
+    }
+
+def preprocess_data(model, dataset, split_name = None, batch_size = 32):
+
+    if split_name:
+      dataset = dataset[split_name]
+
+    emb_dataset = dataset.map(
+        embed_batch_of_examples,
+        batched = True,
         batch_size = batch_size,
-        show_progress_bar = False,
+        remove_columns = dataset.column_names,
+        fn_kwargs = {"model": model},
     )
 
-    return q_emb, cand_embs
+    return emb_dataset
+
+def get_rank(q_emb, cand_embs, answer_pos):
+
+    scores = F.cosine_similarity(
+        torch.tensor(q_emb, dtype=torch.float32),
+        torch.tensor(cand_embs, dtype=torch.float32)
+    )
+
+    # Sort in descending order the similarity scores and retrieve
+    # the index of the correct answer (the rank)
+    ranked_idx = torch.argsort(scores, descending=True).tolist()
+    rank = ranked_idx.index(answer_pos) + 1
+
+    return rank
 
 """### **Hit@k**
 
@@ -105,53 +153,39 @@ $$Hit@k = \frac{1}{N} \sum_{i = 1}^{N} \mathbb{I}[rank_i \leq k]$$
 
 where:
 - $\mathbb{I}$ is the indicator function;
-- $k$ is the number of items taken into consideration.
+- $k$ is the size of the top ranked window within which the correct answer is considered a hit;
+- $rank_i$ is the rank of the first relevant chunk for the $i$-th query.
 """
 
-def compute_single_hit_at_k(model, k, query, candidates, answer, batch_size=32):
-
-    # query and candidates emebeddings
-    q_emb, cand_embs = embed_query_and_candidates(
-        model = model,
-        query = query,
-        candidates = candidates,
-    )
-
-    # compute cosine similarity
-    scores = F.cosine_similarity(q_emb, cand_embs) # shape [N, dim]
-
-    ranked_idx = torch.argsort(scores, descending=True).tolist()
-    correct_idx = candidates.index(answer)
-    rank = ranked_idx.index(correct_idx) + 1
+def compute_single_hit_at_k(k, q_emb, cand_embs, answer_pos):
+    rank = get_rank(q_emb, cand_embs, answer_pos)
 
     if rank <= k:
       return 1.0
 
     return 0.0
 
-def compute_hit_at_k(model, dataset, k, batch_size):
+def compute_hit_at_k(k, emb_dataset):
     hits = []
 
-    # Calling the hit at k function over each query
-    for example in dataset:
+    # Calling the hit@k function over each query
+    for example in emb_dataset:
         hit = compute_single_hit_at_k(
-            model = model,
             k = k,
-            query = example["query"],
-            candidates = example["candidate_chunks"],
-            answer = example["answer"],
-            batch_size = batch_size,
+            q_emb = example["q_emb"],
+            cand_embs = example["cand_embs"],
+            answer_pos = example["answer_pos"],
         )
 
         hits.append(hit)
 
     return float(np.mean(hits))
 
-def compute_multiple_hit_at_k(model, dataset, k_s, batch_size):
+def compute_multiple_hit_at_k(k_s, emb_dataset):
     values = {}
 
     for k in k_s:
-        values[k] = compute_hit_at_k(model, dataset, k, batch_size)
+        values[k] = compute_hit_at_k(k, emb_dataset)
 
     return values
 
@@ -165,41 +199,23 @@ $$MRR = \frac{1}{N} \sum_{i=1}^{N} \frac{1}{rank_i}$$
 
 where:
 - $N$ is the total number of queries.
-- $rank_i$ is the rank of the first relevant document for the $i$-th query.
+- $rank_i$ is the rank of the first relevant chunk for the $i$-th query.
 """
 
-def compute_reciprocal_rank(model, query, candidates, answer, batch_size):
-
-    # query and candidates embeddings
-    q_emb, cand_embs = embed_query_and_candidates(
-        model = model,
-        query = query,
-        candidates = candidates,
-    )
-
-    # cosine similarity between query and candidate chunks
-    scores = F.cosine_similarity(q_emb, cand_embs)
-
-    # Sort in descending order the similarity scores and retrieve
-    # the index of the answer to compute 1/rank (reciprocal rank) for
-    # the selected query.
-    ranked_idx = torch.argsort(scores, descending=True).tolist()
-    correct_idx = candidates.index(answer)
-    rank = ranked_idx.index(correct_idx) + 1
+def compute_reciprocal_rank(q_emb, cand_embs, answer_pos):
+    rank = get_rank(q_emb, cand_embs, answer_pos)
 
     return 1.0 / rank
 
-def compute_mrr(model, dataset, batch_size=32):
+def compute_mrr(emb_dataset, batch_size=32):
     reciprocal_ranks = []
 
     # Calling the reciprocal rank function over each query
-    for example in dataset:
+    for example in emb_dataset:
         rr = compute_reciprocal_rank(
-            model = model,
-            query = example["query"],
-            candidates = example["candidate_chunks"],
-            answer = example["answer"],
-            batch_size = batch_size,
+            q_emb = example["q_emb"],
+            cand_embs = example["cand_embs"],
+            answer_pos = example["answer_pos"],
         )
         reciprocal_ranks.append(rr)
 
@@ -207,30 +223,70 @@ def compute_mrr(model, dataset, batch_size=32):
 
 """# **Baseline**"""
 
-baseline_model = SentenceTransformer("distilbert-base-uncased")
-baseline_model.to(device)
+bert_baseline_model = SentenceTransformer("distilbert-base-uncased")
+bert_baseline_model.to(device)
 
-baseline_mrr = compute_mrr(
-    model = baseline_model,
-    dataset = ds_test,
+MiniLM_baseline_model = SentenceTransformer("all-MiniLM-L6-v2")
+MiniLM_baseline_model.to(device)
+
+# Precompute embeddings with the baseline models
+bert_emb_dataset = preprocess_data(
+    model = bert_baseline_model,
+    dataset = ds,
+    split_name = "test",
 )
 
+MiniLM_emb_dataset = preprocess_data(
+    model = MiniLM_baseline_model,
+    dataset = ds,
+    split_name = "test",
+)
+
+# Compute MRR with the baseline models
+bert_baseline_mrr = compute_mrr(
+    emb_dataset = bert_emb_dataset,
+)
+
+MiniLM_baseline_mrr = compute_mrr(
+    emb_dataset = MiniLM_emb_dataset,
+)
+
+# Compute hit@k with the baseline models
 k_s = [1, 3, 5]
-baseline_hits_at_k = compute_multiple_hit_at_k(
-    model = baseline_model,
-    dataset = ds_test,
+
+bert_baseline_hits_at_k = compute_multiple_hit_at_k(
+    emb_dataset = bert_emb_dataset,
+    k_s = k_s,
+)
+
+MiniLM_baseline_hits_at_k = compute_multiple_hit_at_k(
+    emb_dataset = MiniLM_emb_dataset,
     k_s = k_s,
 )
 
 print("Baseline Model: distilbert-base-uncased")
-print(f"Baseline MRR: {baseline_mrr}:.4f")
+print(f"Baseline MRR: {bert_baseline_mrr:.4f}")
 print("Baseline Hit@k:")
-print(f"k = 1: {baseline_hits_at_k[1]} | k = 3: {baseline_hits_at_k[3]} | k = 5: {baseline_hits_at_k[5]}")
+print(
+    f"k = 1: {bert_baseline_hits_at_k[1]:.4f} | "
+    f"k = 3: {bert_baseline_hits_at_k[3]:.4f} | "
+    f"k = 5: {bert_baseline_hits_at_k[5]:.4f}"
+)
+
+print("Baseline Model: all-MiniLM-L6-v2")
+print(f"Baseline MRR: {MiniLM_baseline_mrr:.4f}")
+print("Baseline Hit@k:")
+print(
+    f"k = 1: {MiniLM_baseline_hits_at_k[1]:.4f} | "
+    f"k = 3: {MiniLM_baseline_hits_at_k[3]:.4f} | "
+    f"k = 5: {MiniLM_baseline_hits_at_k[5]:.4f}"
+)
 
 """# **Evaluator**
 
-The evaluator measures the performance of the model by computing:
-- the MRR.
+The evaluator measures the performance of the finetuned model by computing:
+- the $MRR$
+- the $Hit@k, k \in \{1, 3, 5\}$
 """
 
 class Evaluator(SentenceEvaluator):
@@ -242,13 +298,29 @@ class Evaluator(SentenceEvaluator):
         self.name = name
 
     def __call__(self, model, output_path=None, epoch: int = -1, steps: int = -1):
-        mrr = compute_mrr(
+
+        # Preprocess embeddings inside the evaluator to use the current model
+        emb_dataset = preprocess_data(
             model = model,
             dataset = self.dataset,
             batch_size = self.batch_size,
         )
 
-        return {"eval_mrr": mrr}
+        mrr = compute_mrr(
+            emb_dataset = emb_dataset,
+        )
+
+        k_s = [1, 3, 5]
+        hits_at_k = compute_multiple_hit_at_k(
+            emb_dataset = emb_dataset,
+            k_s = k_s,
+        )
+
+        metrics = {"eval_mrr": mrr}
+        for k, hit_value in hits_at_k.items():
+            metrics[f"eval_hit@{k}"] = hit_value
+
+        return metrics
 
 """# **Finetuning using triplets**
 The finetuning process using triplets involves training the `SentenceTransformer` model to embed sentences such that an 'anchor' (the `query`) sentence is similar in the embedding space to a 'positive' sentence (the `correct answer`) than it is to a 'negative' sentence (the `unrelated answer`). This is achieved through a `TripletLoss` function, which optimizes the model to maintain a certain margin between the anchor-positive and anchor-negative distances.
@@ -301,6 +373,9 @@ trainer = SentenceTransformerTrainer(model = model,
                                      evaluator = evaluator,
                                      loss = loss,
                                      callbacks = [EarlyStoppingCallback(early_stopping_patience=2)]
+                                     # Early stopping callback stops the execution if the choosen metric
+                                     # doesn't improve after `early_stopping_patience` evaluation steps
+                                     # (defined in the `eval_strategy` field).
                                      )
 
 # Launching the training
