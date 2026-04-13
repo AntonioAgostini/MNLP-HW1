@@ -580,7 +580,112 @@ def write_topk_tsv(similarity_ladder, k, output_path):
                 f.write(f"{qid}\t{pid}\t{rank + 1}\n")
 
 topk = retrieve_top_k(st_test_sim_ladder, 15, ds["test"])
+COLBERT_DATA_DIR = "/content/colbert-data"
+convert_to_tsv(topk, "queries", os.path.join(COLBERT_DATA_DIR, "queries.tsv"))
+convert_to_tsv(topk, "collection", os.path.join(COLBERT_DATA_DIR, "collection.tsv"))
+write_topk_tsv(st_test_sim_ladder, 15, os.path.join(COLBERT_DATA_DIR, "topk.tsv"))
 
-convert_to_tsv(topk, "queries", "/content/colbert-data/queries.tsv")
-convert_to_tsv(topk, "collection", "/content/colbert-data/collection.tsv")
-write_topk_tsv(st_test_sim_ladder, 15, "/content/colbert-data/topk.tsv")
+COLBERT_RUN_ROOT = "/content/colbert-runs"     # Root directory for ColBERT runs (indexes, logs, checkpoints)
+COLBERT_INDEX_NAME = "hw1-topk"                # Name of the ColBERT index
+COLBERT_CHECKPOINT = "colbert-ir/colbertv2.0"  # Pretrained ColBERT v2 checkpoint
+
+# INDEX TOP-K COLLECTION WITH ColBERT
+with Run().context(RunConfig(root=COLBERT_RUN_ROOT)):
+    # ColBERT configuration: max lengths and indexing settings
+    colbert_config = ColBERTConfig(
+        doc_maxlen=180,
+        query_maxlen=32,
+        nbits=2,          # Number of bits for product quantization (trade-off between speed/memory/accuracy)
+        kmeans_niters=4,
+    )
+
+    # Indexer that uses the pretrained ColBERT checkpoint
+    indexer = Indexer(
+        checkpoint=COLBERT_CHECKPOINT,
+        config=colbert_config,
+    )
+
+    # Build a ColBERT index over the top-k chunks collection
+    indexer.index(
+        name=COLBERT_INDEX_NAME,
+        collection=f"{COLBERT_DATA_DIR}/collection.tsv",
+    )
+
+# RE-RANK TOP-K CANDIDATES WITH ColBERT
+with Run().context(RunConfig(root=COLBERT_RUN_ROOT)):
+    # Searcher that queries the previously built index
+    searcher = Searcher(
+        index=COLBERT_INDEX_NAME,
+        config=colbert_config,
+    )
+
+    # Load all test queries from tsv file
+    queries = Queries(f"{COLBERT_DATA_DIR}/queries.tsv")
+
+    # colbert_rankings: dict {qid -> list of (pid, score)} sorted by ColBERT similarity
+    colbert_rankings = searcher.search_all(
+        queries,
+        k=15,
+    )
+
+# CONVERT ColBERT RANKINGS INTO sim_ladder_reranked
+sim_ladder_reranked = {} # sim_ladder_reranked has the same structure as st_test_sim_ladder: {query_id -> [chunk_id0, chunk_id1, ...]}
+
+for qid, results in colbert_rankings.items():
+    # 'results' is a list of (pid, score) tuples, ordered by ColBERT score
+    # pid has the format "qid_chunkid" (e.g. "123_7"), so we can recover chunk_id
+    chunk_ids = []
+    for pid, score in results:
+        # Extract the original chunk index from the passage id
+        chunk_id = int(pid.split("_")[1])
+        chunk_ids.append(chunk_id)
+
+    sim_ladder_reranked[qid] = chunk_ids
+
+def ranks_from_sim_ladder(sim_ladder, dataset):
+    """
+    Build the list of ranks for the correct answer for each query,
+    given a similarity ladder (sim_ladder) and the original HF dataset.
+
+    sim_ladder: dict {query_id -> [chunk_idx0, chunk_idx1, ...]} representing the ranking.
+    dataset: HuggingFace split (e.g. ds["test"]) containing 'answer_pos' for each query.
+
+    Returns:
+        ranks: list of integer ranks (1-based), one per query.
+    """
+    # Map query_id to the full dataset example for fast lookup
+    id_to_item = {item["query_id"]: item for item in dataset}
+    ranks = []
+
+    for qid, ranked_chunk_ids in sim_ladder.items():
+        item = id_to_item[qid]
+        correct_pos = int(item["answer_pos"])  # Ground-truth chunk index
+
+        # Rank is the (1-based) position of the correct chunk in the ColBERT ranking
+        rank = ranked_chunk_ids.index(correct_pos) + 1
+        ranks.append(rank)
+
+    return ranks
+
+
+# Compute metrics for the ColBERT re-ranked results on the test set
+colbert_ranks = ranks_from_sim_ladder(sim_ladder_reranked, ds["test"])
+colbert_mrr = compute_mrr(colbert_ranks)
+colbert_hits_at_k = compute_multiple_hit_at_k(k_s, colbert_ranks)
+
+print("Re-ranked Model: distilbert-base-uncased + ColBERT")
+print(f"MRR: {colbert_mrr:.4f}")
+print("Hit@k:")
+print(
+    f"k = 1: {colbert_hits_at_k[1]:.4f} | "
+    f"k = 3: {colbert_hits_at_k[3]:.4f} | "
+    f"k = 5: {colbert_hits_at_k[5]:.4f} | "
+    f"k = 10: {colbert_hits_at_k[10]:.4f}"
+)
+
+# JSONL OUTPUT FOR THE RE-RANKED VARIANT (TEST)
+# In the file: for each query_id, the list of chunk indices ordered according to the ColBERT re-ranking.
+produce_jsonl(
+    sim_ladder=sim_ladder_reranked,
+    filename="TheOverfitters-test-distilbert_base_uncased-sentence_triplets-colbert_reranked.jsonl",
+)
