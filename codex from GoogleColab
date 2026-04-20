@@ -622,25 +622,24 @@ st_hits_at_k = compute_multiple_hit_at_k(
 )
 
 # Logging phase
-print("Finetuned Model: distilbert-base-uncased finetuned with sentence triplets")
+print("Finetuned Model: distilbert-base-uncased finetuned with in-batch negatives (MNRL)")
 print(f"Finetuned Model MRR: {st_mrr:.4f}")
 print("Finetuned Model Hit@k:")
 print(
     f"k = 1: {st_hits_at_k[1]:.4f} | "
     f"k = 3: {st_hits_at_k[3]:.4f} | "
-    f"k = 5: {st_hits_at_k[5]:.4f} | "
-    f"k = 10: {st_hits_at_k[10]:.4f} "
+    f"k = 5: {st_hits_at_k[5]:.4f} "
 )
 
-produce_jsonl(st_test_sim_ladder, "TheOverfitters-test-distilbert_base_uncased-sentence_triplets.jsonl")
-produce_jsonl(st_blind_sim_ladder, "TheOverfitters-blind-distilbert_base_uncased-sentence_triplets.jsonl")
+produce_jsonl(st_test_sim_ladder, "TheOverfitters-test-distilbert_base_uncased-in_batch_negatives.jsonl")
+produce_jsonl(st_blind_sim_ladder, "TheOverfitters-blind-distilbert_base_uncased-in_batch_negatives.jsonl")
 
-# Hit@k comparison between baseline models and sentence-triplets finetuning
-sentence_triplets_hit_records = baseline_hit_records + [
+# Hit@k comparison between baseline models and in-batch negatives finetuning
+in_batch_negatives_hit_records = baseline_hit_records + [
     make_hit_metric_record("distilbert-base-uncased + in batch negatives", st_hits_at_k, k_s),
 ]
 
-plot_metric_bar_graph(sentence_triplets_hit_records)
+plot_metric_bar_graph(in_batch_negatives_hit_records)
 
 """# **Hard Negatives Finetuning**
 
@@ -786,8 +785,8 @@ print("Finetuned Model Hit@k:")
 print(
     f"k = 1: {HN_hits_at_k[1]:.4f} | "
     f"k = 3: {HN_hits_at_k[3]:.4f} | "
-    f"k = 5: {HN_hits_at_k[5]:.4f} | "
-    f"k = 10: {HN_hits_at_k[10]:.4f} "
+    f"k = 5: {HN_hits_at_k[5]:.4f}   "
+
 )
 
 produce_jsonl(HN_test_sim_ladder, "TheOverfitters-test-distilbert_base_uncased-hard_negatives.jsonl")
@@ -988,13 +987,13 @@ HN_reranked_hits_at_k = compute_multiple_hit_at_k(
 )
 
 print("Reranked stage: reranker --> ms-marco-MiniLM-L12-v2")
-print(f"Reranked MRR: {HN_reranked_mrr}")
+print(f"Reranked MRR: {HN_reranked_mrr:.4f}")
 print("Reranker Hit@k:")
 print(
     f"k = 1: {HN_reranked_hits_at_k[1]:.4f} | "
     f"k = 3: {HN_reranked_hits_at_k[3]:.4f} | "
-    f"k = 5: {HN_reranked_hits_at_k[5]:.4f} | "
-    f"k = 10: {HN_reranked_hits_at_k[10]:.4f} "
+    f"k = 5: {HN_reranked_hits_at_k[5]:.4f}   "
+
 )
 
 # Hit@k percentage variation against the mpnet baseline
