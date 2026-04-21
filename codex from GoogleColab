@@ -39,7 +39,7 @@ random.seed(42)
 """# **Data preprocessing**"""
 
 # Preparing triplets (anchor, positive, negatives)
-# This function prepares the dataset to finetune the model with the sentence triplets strategy.
+# This function prepares the dataset to finetune the model with the in-batch negatives strategy.
 # For each query, it keeps the answer as positive and samples up to five random negatives.
 def prepare_item(data):
     negatives = [c for c in data["candidate_chunks"] if c != data["answer"]]
@@ -625,7 +625,7 @@ st_hits_at_k = compute_multiple_hit_at_k(
 )
 
 # Logging phase
-print("Finetuned Model: distilbert-base-uncased finetuned with sentence triplets")
+print("Finetuned Model: distilbert-base-uncased finetuned with in-batch negatives")
 print(f"Finetuned Model MRR: {st_mrr:.4f}")
 print("Finetuned Model Hit@k:")
 print(
@@ -995,7 +995,7 @@ HN_reranked_hits_at_k = compute_multiple_hit_at_k(
 )
 
 print("Reranked stage: reranker --> ms-marco-MiniLM-L12-v2")
-print(f"Reranked MRR: {HN_reranked_mrr}")
+print(f"Reranked MRR: {HN_reranked_mrr:.4f}")
 print("Reranker Hit@k:")
 print(
     f"k = 1: {HN_reranked_hits_at_k[1]:.4f} | "
@@ -1016,3 +1016,37 @@ finetuned_hit_records = [
 plot_metric_bar_graph(baseline_hit_records + [make_hit_metric_record("CE-RR", HN_reranked_hits_at_k, k_s)])
 
 plot_metric_delta_from_baseline(mpnet_hit_baseline, finetuned_hit_records)
+
+# MRR comparison chart between all models
+def make_mrr_metric_record(model_name, mrr_value):
+    return {
+        "model_name": model_name,
+        "metrics": [{"metric_name": "MRR", "metric_value": mrr_value}]
+    }
+
+mrr_records = [
+    make_mrr_metric_record("distilbert-base-uncased", bert_baseline_mrr),
+    make_mrr_metric_record("all-MiniLM-L6-v2", MiniLM_baseline_mrr),
+    make_mrr_metric_record("all-mpnet-base-v2", mpnet_baseline_mrr),
+    make_mrr_metric_record("FT-InB", st_mrr),
+    make_mrr_metric_record("FT-HN", HN_mrr),
+    make_mrr_metric_record("CE-RR", HN_reranked_mrr),
+]
+
+plot_metric_bar_graph(mrr_records)
+
+# MRR Percent Change from Baseline MPNet
+
+
+mpnet_mrr_baseline = {
+    "model_name": "all-mpnet-base-v2",
+    "metrics": [{"metric_name": "MRR", "metric_value": mpnet_baseline_mrr}]
+}
+
+mrr_records = [
+    {"model_name": "FT-InB", "metrics": [{"metric_name": "MRR", "metric_value": st_mrr}]},
+    {"model_name": "FT-HN", "metrics": [{"metric_name": "MRR", "metric_value": HN_mrr}]},
+    {"model_name": "CE-RR", "metrics": [{"metric_name": "MRR", "metric_value": HN_reranked_mrr}]},
+]
+
+plot_metric_delta_from_baseline(mpnet_mrr_baseline, mrr_records)
